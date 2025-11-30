@@ -1,36 +1,85 @@
-// Worker A (改良版) — SHA-in-path + ?meta=1 (文本优先、二进制 base64)
-// 自动移除仓库名后多余的 /blob 段
+// Worker: 支持多种路径形式（包括直接传入完整 raw URL）
+// 功能：SHA-in-path 绕过 + ?meta=1（文本优先，二进制 base64）+ 自动移除 /blob
 
 export default {
   async fetch(request, env) {
     try {
       const url = new URL(request.url);
-      const path = url.pathname.replace(/^\/+/, "");
+      let path = url.pathname.replace(/^\/+/, ""); // 去掉开头斜杠
       if (!path) return new Response("Worker Running", { status: 200 });
 
       const wantMeta = url.searchParams.get("meta") === "1";
 
-      // parse raw path parts
-      const partsRaw = path.split("/").filter(p => p !== "");
-      if (partsRaw.length < 3) return new Response("路径格式: /owner/repo/branch/path/to/file", { status: 400 });
-
-      // If the 3rd segment is "blob" (i.e. /owner/repo/blob/branch/...), remove it.
-      // After removal, expected parts: [owner, repo, branch, ...filePath]
-      const parts = partsRaw.slice(); // clone
-      if (parts[2] && parts[2].toLowerCase() === "blob") {
-        // remove the "blob" segment
-        parts.splice(2, 1);
+      // 如果 path 看起来像一个完整 URL（以 http:// 或 https:// 开头），解码它
+      // 例如: https://cndm.pp.ua/https://raw.githubusercontent.com/owner/repo/branch/file
+      // 或: https://cndm.pp.ua/http://example.com/...
+      let isFullUrl = false;
+      let parsedFromFull = null;
+      if (/^https?:\/\//i.test(path)) {
+        // path 是完整 URL 字符串
+        isFullUrl = true;
+        try {
+          // decode in case someone encoded slashes etc
+          const decoded = decodeURIComponent(path);
+          const parsed = new URL(decoded);
+          parsedFromFull = parsed; // URL object
+        } catch (e) {
+          // 如果 decode 或 new URL 失败，继续按普通 path 处理
+          parsedFromFull = null;
+          console.error("解析完整 URL 失败:", e);
+        }
+      } else {
+        // 也可能是用户把完整 url 作为转义过的字符串（例如 https:/ /raw... without second slash）
+        // 不强制处理这些怪异情况，继续常规解析
       }
 
-      // Re-check length after potential removal
-      if (parts.length < 3) return new Response("路径格式: /owner/repo/branch/path/to/file", { status: 400 });
+      // 解析出 owner, repo, branch, filePath
+      let owner, repo, branch, filePath;
 
-      const owner = parts[0];
-      const repo = parts[1];
-      const branch = parts[2] || "main";
-      const filePath = parts.slice(3).join("/");
+      if (parsedFromFull && parsedFromFull.hostname && parsedFromFull.hostname.includes("raw.githubusercontent.com")) {
+        // 从完整 raw URL 解析 path parts
+        // raw URL path 格式: /owner/repo/branch/path/to/file OR /owner/repo/sha/path
+        const p = parsedFromFull.pathname.replace(/^\/+/, "").split("/").filter(Boolean);
+        // Remove potential 'blob' if present at position 2? (unlikely in raw URL but safe)
+        // raw.githubusercontent URLs normally don't have /blob, but handle generically
+        const pClean = p.slice();
+        if (pClean[2] && pClean[2].toLowerCase() === "blob") {
+          pClean.splice(2, 1);
+        }
+        if (pClean.length >= 3) {
+          owner = pClean[0]; repo = pClean[1]; branch = pClean[2];
+          filePath = pClean.slice(3).join("/");
+        } else {
+          // 格式异常，回退到把整个 raw URL 当作 fetchUrl（不进行 SHA 优化）
+          owner = null;
+        }
+      }
 
-      // prepare headers for API
+      // 如果不是完整 raw URL，按常规 /owner/repo/branch/... 解析，并移除可能的 /blob 段
+      if (!owner) {
+        // parse raw path segments and remove 'blob' if present right after repo
+        const partsRaw = path.split("/").filter(p => p !== "");
+        // handle case: /owner/repo/blob/branch/...
+        if (partsRaw.length >= 3 && partsRaw[2].toLowerCase() === "blob") {
+          // remove the 'blob' segment
+          partsRaw.splice(2, 1);
+        }
+        if (partsRaw.length < 3) {
+          // invalid format
+          return new Response("路径格式: /owner/repo/branch/path/to/file 或 /https://raw.githubusercontent.com/owner/repo/branch/path", { status: 400 });
+        }
+        owner = partsRaw[0];
+        repo = partsRaw[1];
+        branch = partsRaw[2] || "main";
+        filePath = partsRaw.slice(3).join("/");
+      }
+
+      // 如果 filePath 为空（例如只访问 /owner/repo/branch/），拒绝
+      if (!filePath) {
+        return new Response("请指定仓库内的文件路径，例如 /owner/repo/branch/path/to/file", { status: 400 });
+      }
+
+      // prepare headers for GitHub API and raw fetch
       const apiHeaders = new Headers();
       if (env.GH_TOKEN) apiHeaders.append("Authorization", `token ${env.GH_TOKEN}`);
       apiHeaders.append("User-Agent", "Cloudflare-Worker"); // GitHub API 要求
@@ -38,7 +87,6 @@ export default {
       // get latest sha (cached inside)
       const sha = await getLatestSha(owner, repo, branch, apiHeaders);
       if (!sha) {
-        // 如果无法拿到 sha，仍继续尝试用 branch URL 以保证可用性
         console.error("无法获取 SHA，回退到 branch URL");
       }
 
@@ -51,12 +99,14 @@ export default {
         if (cached) lastSha = (await cached.json()).sha;
       } catch (e) { console.error("读取 sha cache 错误", e); }
 
-      // choose fetchUrl: if sha available and changed -> use sha-in-path; else use branch path
+      // choose fetchUrl
       let fetchUrl;
       if (sha && (!lastSha || lastSha !== sha)) {
+        // use sha in path (this produces a distinct URL reliably bypassing CDN cache)
         fetchUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${sha}/${filePath}`;
         console.log("SHA changed, using SHA-in-path:", fetchUrl);
       } else {
+        // use branch path
         fetchUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${filePath}`;
       }
 
@@ -68,12 +118,20 @@ export default {
         }));
       } catch (e) { console.error("写入 sha cache 失败", e); }
 
-      // fetch file content (raw). 如果私有仓库，token 会用于授权
+      // Prepare headers for raw fetch (Authorization if private)
       const rawHeaders = new Headers();
       if (env.GH_TOKEN) rawHeaders.append("Authorization", `token ${env.GH_TOKEN}`);
-      // raw 请求不用必须附 User-Agent，但加上也无害
       rawHeaders.append("User-Agent", "Cloudflare-Worker");
 
+      // If the original request was a full raw URL not matching our parsed owner/repo/branch/filePath
+      // (e.g. user provided some other host), we still allow fetching that original URL:
+      // If parsedFromFull exists but we failed to extract owner/repo properly, fallback to that full URL.
+      if (parsedFromFull && (!owner || !repo || !branch || !filePath)) {
+        // Use the original full URL as-is
+        fetchUrl = parsedFromFull.toString();
+      }
+
+      // fetch the resource
       const originResp = await fetch(fetchUrl, { headers: rawHeaders, cf: { cacheTtl: 0, cacheEverything: false } });
       if (!originResp.ok) {
         const txt = await originResp.text().catch(() => "");
@@ -84,7 +142,7 @@ export default {
       const buf = await originResp.arrayBuffer();
       const contentType = originResp.headers.get("content-type") || "application/octet-stream";
 
-      // 如果不是 meta 模式，直接返回原始内容（并设置不缓存 header）
+      // non-meta: return raw content, preserving content-type, and add debug headers
       if (!wantMeta) {
         const outHeaders = new Headers(originResp.headers);
         outHeaders.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
@@ -97,7 +155,7 @@ export default {
         return new Response(buf, { status: originResp.status, headers: outHeaders });
       }
 
-      // meta 模式：文本优先，二进制 base64
+      // meta mode: text-first, else base64
       let content;
       let content_is_base64 = false;
       if (isTextContentType(contentType)) {
@@ -111,7 +169,6 @@ export default {
           content_is_base64 = true;
         }
       } else {
-        // 二进制 -> base64
         content = arrayBufferToBase64(buf);
         content_is_base64 = true;
       }
