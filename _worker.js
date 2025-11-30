@@ -1,153 +1,199 @@
-let token = "";
+// Worker A (改良版) — SHA-in-path + ?meta=1 (文本优先、二进制 base64)
+// 自动移除仓库名后多余的 /blob 段
+
 export default {
-	async fetch(request, env) {
-		const url = new URL(request.url);
-		if (url.pathname !== '/') {
-			let githubRawUrl = 'https://raw.githubusercontent.com';
-			if (new RegExp(githubRawUrl, 'i').test(url.pathname)) {
-				githubRawUrl += url.pathname.split(githubRawUrl)[1];
-			} else {
-				if (env.GH_NAME) {
-					githubRawUrl += '/' + env.GH_NAME;
-					if (env.GH_REPO) {
-						githubRawUrl += '/' + env.GH_REPO;
-						if (env.GH_BRANCH) githubRawUrl += '/' + env.GH_BRANCH;
-					}
-				}
-				githubRawUrl += url.pathname;
-			}
-			//console.log(githubRawUrl);
-			
-			// 初始化请求头
-			const headers = new Headers();
-			let authTokenSet = false; // 标记是否已经设置了认证token
-			
-			// 检查TOKEN_PATH特殊路径鉴权
-			if (env.TOKEN_PATH) {
-				const 需要鉴权的路径配置 = await ADD(env.TOKEN_PATH);
-				// 将路径转换为小写进行比较，防止大小写绕过
-				const normalizedPathname = decodeURIComponent(url.pathname.toLowerCase());
+  async fetch(request, env) {
+    try {
+      const url = new URL(request.url);
+      const path = url.pathname.replace(/^\/+/, "");
+      if (!path) return new Response("Worker Running", { status: 200 });
 
-				//检测访问路径是否需要鉴权
-				for (const pathConfig of 需要鉴权的路径配置) {
-					const configParts = pathConfig.split('@');
-					if (configParts.length !== 2) {
-						// 如果格式不正确，跳过这个配置
-						continue;
-					}
+      const wantMeta = url.searchParams.get("meta") === "1";
 
-					const [requiredToken, pathPart] = configParts;
-					const normalizedPath = '/' + pathPart.toLowerCase().trim();
+      // parse raw path parts
+      const partsRaw = path.split("/").filter(p => p !== "");
+      if (partsRaw.length < 3) return new Response("路径格式: /owner/repo/branch/path/to/file", { status: 400 });
 
-					// 精确匹配路径段，防止部分匹配绕过
-					const pathMatches = normalizedPathname === normalizedPath ||
-						normalizedPathname.startsWith(normalizedPath + '/');
+      // If the 3rd segment is "blob" (i.e. /owner/repo/blob/branch/...), remove it.
+      // After removal, expected parts: [owner, repo, branch, ...filePath]
+      const parts = partsRaw.slice(); // clone
+      if (parts[2] && parts[2].toLowerCase() === "blob") {
+        // remove the "blob" segment
+        parts.splice(2, 1);
+      }
 
-					if (pathMatches) {
-						const providedToken = url.searchParams.get('token');
-						if (!providedToken) {
-							return new Response('TOKEN不能为空', { status: 400 });
-						}
+      // Re-check length after potential removal
+      if (parts.length < 3) return new Response("路径格式: /owner/repo/branch/path/to/file", { status: 400 });
 
-						if (providedToken !== requiredToken.trim()) {
-							return new Response('TOKEN错误', { status: 403 });
-						}
+      const owner = parts[0];
+      const repo = parts[1];
+      const branch = parts[2] || "main";
+      const filePath = parts.slice(3).join("/");
 
-						// token验证成功，使用GH_TOKEN作为GitHub请求的token
-						if (!env.GH_TOKEN) {
-							return new Response('服务器GitHub TOKEN配置错误', { status: 500 });
-						}
-						headers.append('Authorization', `token ${env.GH_TOKEN}`);
-						authTokenSet = true;
-						break; // 找到匹配的路径配置后退出循环
-					}
-				}
-			}
-			
-			// 如果TOKEN_PATH没有设置认证，使用默认token逻辑
-			if (!authTokenSet) {
-				if (env.GH_TOKEN && env.TOKEN) {
-					if (env.TOKEN == url.searchParams.get('token')) token = env.GH_TOKEN || token;
-					else token = url.searchParams.get('token') || token;
-				} else token = url.searchParams.get('token') || env.GH_TOKEN || env.TOKEN || token;
-				
-				const githubToken = token;
-				//console.log(githubToken);
-				if (!githubToken || githubToken == '') {
-					return new Response('TOKEN不能为空', { status: 400 });
-				}
-				headers.append('Authorization', `token ${githubToken}`);
-			}
+      // prepare headers for API
+      const apiHeaders = new Headers();
+      if (env.GH_TOKEN) apiHeaders.append("Authorization", `token ${env.GH_TOKEN}`);
+      apiHeaders.append("User-Agent", "Cloudflare-Worker"); // GitHub API 要求
 
-			// 发起请求
-			const response = await fetch(githubRawUrl, { headers });
+      // get latest sha (cached inside)
+      const sha = await getLatestSha(owner, repo, branch, apiHeaders);
+      if (!sha) {
+        // 如果无法拿到 sha，仍继续尝试用 branch URL 以保证可用性
+        console.error("无法获取 SHA，回退到 branch URL");
+      }
 
-			// 检查请求是否成功 (状态码 200 到 299)
-			if (response.ok) {
-				return new Response(response.body, {
-					status: response.status,
-					headers: response.headers
-				});
-			} else {
-				const errorText = env.ERROR || '无法获取文件，检查路径或TOKEN是否正确。';
-				// 如果请求不成功，返回适当的错误响应
-				return new Response(errorText, { status: response.status });
-			}
+      // read last saved sha for this file
+      const cache = caches.default;
+      const shaCacheKey = new Request(`sha://${owner}/${repo}/${filePath}`);
+      let lastSha = null;
+      try {
+        const cached = await cache.match(shaCacheKey);
+        if (cached) lastSha = (await cached.json()).sha;
+      } catch (e) { console.error("读取 sha cache 错误", e); }
 
-		} else {
-			const envKey = env.URL302 ? 'URL302' : (env.URL ? 'URL' : null);
-			if (envKey) {
-				const URLs = await ADD(env[envKey]);
-				const URL = URLs[Math.floor(Math.random() * URLs.length)];
-				return envKey === 'URL302' ? Response.redirect(URL, 302) : fetch(new Request(URL, request));
-			}
-			//首页改成一个nginx伪装页
-			return new Response(await nginx(), {
-				headers: {
-					'Content-Type': 'text/html; charset=UTF-8',
-				},
-			});
-		}
-	}
+      // choose fetchUrl: if sha available and changed -> use sha-in-path; else use branch path
+      let fetchUrl;
+      if (sha && (!lastSha || lastSha !== sha)) {
+        fetchUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${sha}/${filePath}`;
+        console.log("SHA changed, using SHA-in-path:", fetchUrl);
+      } else {
+        fetchUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${filePath}`;
+      }
+
+      // update sha cache (short TTL)
+      try {
+        await cache.put(shaCacheKey, new Response(JSON.stringify({ sha }), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=10, s-maxage=10" }
+        }));
+      } catch (e) { console.error("写入 sha cache 失败", e); }
+
+      // fetch file content (raw). 如果私有仓库，token 会用于授权
+      const rawHeaders = new Headers();
+      if (env.GH_TOKEN) rawHeaders.append("Authorization", `token ${env.GH_TOKEN}`);
+      // raw 请求不用必须附 User-Agent，但加上也无害
+      rawHeaders.append("User-Agent", "Cloudflare-Worker");
+
+      const originResp = await fetch(fetchUrl, { headers: rawHeaders, cf: { cacheTtl: 0, cacheEverything: false } });
+      if (!originResp.ok) {
+        const txt = await originResp.text().catch(() => "");
+        return new Response(txt || "无法获取文件", { status: originResp.status });
+      }
+
+      // read body
+      const buf = await originResp.arrayBuffer();
+      const contentType = originResp.headers.get("content-type") || "application/octet-stream";
+
+      // 如果不是 meta 模式，直接返回原始内容（并设置不缓存 header）
+      if (!wantMeta) {
+        const outHeaders = new Headers(originResp.headers);
+        outHeaders.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+        outHeaders.set("Pragma", "no-cache");
+        outHeaders.set("Expires", "0");
+        outHeaders.set("X-Fetched-By", "sha-in-path");
+        outHeaders.set("X-Used-URL", fetchUrl);
+        outHeaders.set("X-Origin-CF-Cache", originResp.headers.get("cf-cache-status") || "none");
+        outHeaders.set("X-Origin-Age", originResp.headers.get("age") || "0");
+        return new Response(buf, { status: originResp.status, headers: outHeaders });
+      }
+
+      // meta 模式：文本优先，二进制 base64
+      let content;
+      let content_is_base64 = false;
+      if (isTextContentType(contentType)) {
+        try {
+          const decoder = new TextDecoder("utf-8");
+          content = decoder.decode(buf);
+          content_is_base64 = false;
+        } catch (e) {
+          console.error("文本解码失败，转 base64 返回", e);
+          content = arrayBufferToBase64(buf);
+          content_is_base64 = true;
+        }
+      } else {
+        // 二进制 -> base64
+        content = arrayBufferToBase64(buf);
+        content_is_base64 = true;
+      }
+
+      const meta = {
+        sha: sha || null,
+        fetched_at: new Date().toISOString(),
+        content,
+        content_is_base64,
+        content_type: contentType,
+        status: originResp.status
+      };
+
+      return new Response(JSON.stringify(meta), {
+        status: 200,
+        headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0" }
+      });
+
+    } catch (e) {
+      console.error("Worker 错误:", e);
+      return new Response("Worker 内部错误: " + (e && e.message || e), { status: 500 });
+    }
+  }
 };
 
-async function nginx() {
-	const text = `
-	<!DOCTYPE html>
-	<html>
-	<head>
-	<title>Welcome to nginx!</title>
-	<style>
-		body {
-			width: 35em;
-			margin: 0 auto;
-			font-family: Tahoma, Verdana, Arial, sans-serif;
-		}
-	</style>
-	</head>
-	<body>
-	<h1>Welcome to nginx!</h1>
-	<p>If you see this page, the nginx web server is successfully installed and
-	working. Further configuration is required.</p>
-	
-	<p>For online documentation and support please refer to
-	<a href="http://nginx.org/">nginx.org</a>.<br/>
-	Commercial support is available at
-	<a href="http://nginx.com/">nginx.com</a>.</p>
-	
-	<p><em>Thank you for using nginx.</em></p>
-	</body>
-	</html>
-	`
-	return text;
+// ---------------- helper: getLatestSha (带短期缓存) ----------------
+async function getLatestSha(owner, repo, branch, headers) {
+  const cache = caches.default;
+  const cacheKey = new Request(`branch-sha://${owner}/${repo}/${branch}`);
+  try {
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+      try { const j = await cached.json(); if (j && j.sha) return j.sha; } catch (e) {}
+    }
+
+    const apiUrl = `https://api.github.com/repos/${owner}/${repo}/commits/${encodeURIComponent(branch)}`;
+    const resp = await fetch(apiUrl, { headers });
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => "");
+      console.error("getLatestSha API 错误:", resp.status, t);
+      return null;
+    }
+    const body = await resp.json();
+    const sha = body && body.sha ? body.sha : null;
+    if (!sha) return null;
+
+    try {
+      await cache.put(cacheKey, new Response(JSON.stringify({ sha }), {
+        status: 200,
+        headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=5, s-maxage=5" }
+      }));
+    } catch (e) { console.error("put branch sha cache fail", e); }
+
+    return sha;
+  } catch (e) {
+    console.error("getLatestSha 错误:", e);
+    return null;
+  }
 }
 
-async function ADD(envadd) {
-	var addtext = envadd.replace(/[	|"'\r\n]+/g, ',').replace(/,+/g, ',');	// 将空格、双引号、单引号和换行符替换为逗号
-	//console.log(addtext);
-	if (addtext.charAt(0) == ',') addtext = addtext.slice(1);
-	if (addtext.charAt(addtext.length - 1) == ',') addtext = addtext.slice(0, addtext.length - 1);
-	const add = addtext.split(',');
-	//console.log(add);
-	return add;
+// ---------------- helper: 判断是否为文本类型 ----------------
+function isTextContentType(ct) {
+  if (!ct) return false;
+  ct = ct.toLowerCase();
+  if (ct.startsWith("text/")) return true;
+  if (ct.includes("json") || ct.includes("javascript") || ct.includes("xml") || ct.includes("html") || ct.includes("svg") || ct.includes("yaml") || ct.includes("css")) return true;
+  return false;
+}
+
+// ---------------- helper: ArrayBuffer -> base64 ----------------
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000; // 32KB per chunk
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode.apply(null, chunk);
+  }
+  try {
+    return btoa(binary);
+  } catch (e) {
+    console.error("base64 编码失败", e);
+    return "";
+  }
 }
